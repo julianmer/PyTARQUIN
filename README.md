@@ -1,5 +1,6 @@
 <div align="center">
-  <h1 style="margin-bottom: 5px;">PyTARQUIN</h1>
+  <img src="https://raw.githubusercontent.com/julianmer/PyTARQUIN/main/assets/logo.png" alt="PyTARQUIN Logo" width="160"/>
+  <h1 style="margin-top:-10px; margin-bottom: 5px;">PyTARQUIN</h1>
   <p style="margin-top: 0px;"><em>A lightweight Python wrapper for TARQUIN spectral fitting in MR spectroscopy</em></p>
 
   [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
