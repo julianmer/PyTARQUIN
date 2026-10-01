@@ -1,0 +1,422 @@
+####################################################################################################
+# Builds portable command-line TARQUIN binaries and a container image from the pinned upstream
+# commit plus tarquin/cli-build.patch, all through tarquin/build.sh:
+#
+#   linux    x86_64 / aarch64  - fully static (musl), built in tarquin/dockerfile
+#   macOS    arm64 / x86_64    - links only the OS (Accelerate, libc++, libSystem), built on the runner
+#   windows  x86_64            - static, built under MSYS2 UCRT64
+#   image    ghcr.io/<owner>/tarquin  - the Linux binary as a multi-arch image (amd64 + arm64)
+#
+# Upstream ships GUI bundles only (Linux 32-bit, macOS Intel in a disk image, Windows 4.3.10);
+# these close the gap. Each job runs the full test suite against its own binary, including the
+# acceptance test: fitting the 2016 challenge must reproduce the official 4.3.11 release.
+#
+# Native runners on purpose: Boost, FFTW and LAPACK are compiled from source, which under QEMU
+# takes far longer. The image is therefore pushed per architecture by digest and merged into
+# one manifest afterwards.
+#
+# Every push to main and every pull request that touches the build inputs builds and tests.
+# A version tag ("v0.1.0"; tarquin_wrapper/_version.py is the source of truth) additionally
+# publishes: image to GHCR, binaries and their corresponding source to the GitHub release,
+# wheel to PyPI. A manual run publishes the image as ":edge" only.
+####################################################################################################
+
+name: tarquin-binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+    paths:
+      - 'tarquin/**'
+      - 'tarquin_wrapper/**'
+      - 'tests/**'
+      - 'example_data/**'
+      - 'pyproject.toml'
+      - '.github/workflows/tarquin-binaries.yml'
+  pull_request:
+    paths:
+      - 'tarquin/**'
+      - 'tarquin_wrapper/**'
+      - 'tests/**'
+      - 'example_data/**'
+      - 'pyproject.toml'
+      - '.github/workflows/tarquin-binaries.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# a newer push to the same branch makes an unfinished run pointless; tags always finish
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # Must be lowercase for the registry; the owner login already is.
+  IMAGE: ghcr.io/${{ github.repository_owner }}/tarquin
+  PUBLISH: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+  # No ".dockerbuild" debug artifacts on every run
+  DOCKER_BUILD_RECORD_UPLOAD: false
+
+jobs:
+  #------------------------------------------------------------------------------------------#
+  #  Linux: static binary via tarquin/dockerfile, plus the per-arch image                    #
+  #------------------------------------------------------------------------------------------#
+  linux:
+    name: linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: arm64
+            runner: ubuntu-24.04-arm    # native ARM runner; no QEMU
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build TARQUIN
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tarquin/dockerfile
+          load: true
+          tags: tarquin-build:${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Extract the binary
+        run: |
+          # "docker create" never runs the entrypoint, so this works on a scratch image
+          # with no shell.
+          cid=$(docker create tarquin-build:${{ matrix.arch }})
+          docker cp "$cid:/usr/local/bin/tarquin" ./tarquin.bin
+          docker rm "$cid"
+          chmod +x ./tarquin.bin
+          file ./tarquin.bin
+          ls -lh ./tarquin.bin
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the wrapper
+        run: pip install -q -e '.[test]'
+
+      - name: Test with the new binary
+        # includes the acceptance test: the challenge fit must reproduce the reference
+        run: TARQUIN_EXEC="$PWD/tarquin.bin" python -m pytest tests -q -rs
+
+      - name: Fit the challenge data through the image
+        # Exactly what a Docker user runs: the launcher from binaries.py in front of the
+        # image, working directory and home bind-mounted, non-root uid.
+        run: |
+          launcher=$(python -c "from tarquin_wrapper import binaries; \
+            print(binaries._write_shim(binaries._cache_root(), 'docker', 'tarquin-build:${{ matrix.arch }}'))")
+          TARQUIN_EXEC="$launcher" python -m pytest tests/test_tarquin.py -q
+
+      - name: Compress
+        run: |
+          xz -9 -k -c ./tarquin.bin > "tarquin-linux-${{ matrix.arch }}.xz"
+          ls -lh "tarquin-linux-${{ matrix.arch }}.xz"
+          sha256sum "tarquin-linux-${{ matrix.arch }}.xz" \
+            | tee "tarquin-linux-${{ matrix.arch }}.xz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarquin-linux-${{ matrix.arch }}
+          path: |
+            tarquin-linux-${{ matrix.arch }}.xz
+            tarquin-linux-${{ matrix.arch }}.xz.sha256
+          retention-days: 14
+
+      #-- image publishing (tag / manual runs only) --------------------------------------#
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the image by digest
+        if: env.PUBLISH == 'true'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tarquin/dockerfile
+          platforms: linux/${{ matrix.platform }}
+          # Untagged push; the "image" job below stitches both digests into one manifest.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+
+      - name: Export the digest
+        if: env.PUBLISH == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH == 'true'
+        with:
+          name: digests-${{ matrix.platform }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  #------------------------------------------------------------------------------------------#
+  #  macOS: built directly on the runner, linking only the OS                                #
+  #------------------------------------------------------------------------------------------#
+  macos:
+    name: macos ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14            # oldest arm64 image: oldest SDK, widest reach
+          - arch: x86_64
+            runner: macos-15-intel
+    env:
+      FC: gfortran-14
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Cache Boost and FFTW
+        uses: actions/cache@v4
+        with:
+          path: tarquin/work/deps
+          key: deps-macos-${{ matrix.arch }}-${{ hashFiles('tarquin/build.sh') }}
+
+      - name: Build TARQUIN
+        run: tarquin/build.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the wrapper
+        run: pip install -q -e '.[test]'
+
+      - name: Test with the new binary
+        run: TARQUIN_EXEC="$PWD/tarquin/dist/tarquin" python -m pytest tests -q -rs
+
+      - name: Compress
+        run: |
+          command -v xz >/dev/null || brew install xz
+          xz -9 -k -c tarquin/dist/tarquin > "tarquin-macos-${{ matrix.arch }}.xz"
+          ls -lh "tarquin-macos-${{ matrix.arch }}.xz"
+          shasum -a 256 "tarquin-macos-${{ matrix.arch }}.xz" \
+            | tee "tarquin-macos-${{ matrix.arch }}.xz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarquin-macos-${{ matrix.arch }}
+          path: |
+            tarquin-macos-${{ matrix.arch }}.xz
+            tarquin-macos-${{ matrix.arch }}.xz.sha256
+          retention-days: 14
+
+  #------------------------------------------------------------------------------------------#
+  #  Windows: static, built under MSYS2 UCRT64                                               #
+  #------------------------------------------------------------------------------------------#
+  windows:
+    name: windows x86_64
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git curl tar xz make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gcc-fortran
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Cache Boost, FFTW and LAPACK
+        uses: actions/cache@v4
+        with:
+          path: tarquin/work/deps
+          key: deps-windows-x86_64-${{ hashFiles('tarquin/build.sh') }}
+
+      - name: Build TARQUIN
+        shell: msys2 {0}
+        run: tarquin/build.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the wrapper
+        run: pip install -q -e '.[test]'
+
+      - name: Test with the new binary
+        run: |
+          $env:TARQUIN_EXEC = "$PWD\tarquin\dist\tarquin.exe"
+          python -m pytest tests -q -rs
+
+      - name: Compress
+        shell: msys2 {0}
+        run: |
+          xz -9 -k -c tarquin/dist/tarquin.exe > tarquin-windows-x86_64.xz
+          ls -lh tarquin-windows-x86_64.xz
+          sha256sum tarquin-windows-x86_64.xz | tee tarquin-windows-x86_64.xz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarquin-windows-x86_64
+          path: |
+            tarquin-windows-x86_64.xz
+            tarquin-windows-x86_64.xz.sha256
+          retention-days: 14
+
+  #------------------------------------------------------------------------------------------#
+  #  merge the per-arch image digests into one multi-arch tag                                 #
+  #------------------------------------------------------------------------------------------#
+  image:
+    name: publish multi-arch image
+    needs: linux
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the manifest
+        working-directory: /tmp/digests
+        run: |
+          # A tag push gets its own tag plus "latest"; a manual run only "edge", so that
+          # what PyTARQUIN pulls by default (the release tag) is never moved by hand.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tags=("${GITHUB_REF#refs/tags/}" latest)
+          else
+            tags=(edge)
+          fi
+          args=()
+          for t in "${tags[@]}"; do args+=(-t "${IMAGE}:${t}"); done
+          docker buildx imagetools create "${args[@]}" $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:${tags[0]}"
+
+  #------------------------------------------------------------------------------------------#
+  #  attach every binary, and their corresponding source, to the release                     #
+  #------------------------------------------------------------------------------------------#
+  release:
+    name: attach to release
+    needs: [linux, macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tarquin-*
+          merge-multiple: true
+
+      - name: Corresponding source
+        # GPL-3.0: the exact upstream commit, the patch and the build scripts, in one archive
+        run: |
+          ref=$(sed -n 's/^TARQUIN_REF=\([0-9a-f]*\).*/\1/p' tarquin/build.sh)
+          echo "TARQUIN_REF=$ref" >> "$GITHUB_ENV"
+          name="tarquin-source-${ref:0:7}"
+          git init -q upstream
+          git -C upstream fetch -q --depth 1 https://github.com/martin3141/tarquin.git "$ref"
+          mkdir -p "src/$name"
+          git -C upstream archive --prefix=upstream/ FETCH_HEAD | tar -x -C "src/$name"
+          cp -r tarquin "src/$name/build"
+          cp LICENSE.tarquin NOTICE "src/$name/"
+          tar -czf "dist/$name.tar.gz" -C src "$name"
+          cp LICENSE.tarquin NOTICE dist/
+          ls -lhR dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            PyTARQUIN ${{ github.ref_name }} (`pip install tarquin-wrapper`).
+
+            Attached: portable command-line TARQUIN 4.3.11 binaries, built from
+            github.com/martin3141/tarquin `${{ env.TARQUIN_REF }}` with the build-system
+            patch in `tarquin/`, which this version of the wrapper downloads on demand:
+
+            - `tarquin-linux-x86_64.xz`, `tarquin-linux-aarch64.xz` - fully static
+            - `tarquin-macos-arm64.xz`, `tarquin-macos-x86_64.xz` (macOS 11+) - link only the OS
+            - `tarquin-windows-x86_64.xz` - static
+            - container image: `${{ env.IMAGE }}:${{ github.ref_name }}` (linux/amd64, linux/arm64)
+
+            Each `.xz` has a `.sha256` sidecar; PyTARQUIN verifies it before use.
+
+            TARQUIN is a separate GPL-3.0 program, (c) Greg Reynolds and Martin Wilson. See
+            `LICENSE.tarquin` and `NOTICE` attached here; `tarquin-source-*.tar.gz` is the
+            complete corresponding source of these binaries (upstream commit, patch, build
+            scripts).
+
+  #------------------------------------------------------------------------------------------#
+  #  publish the wheel - after the release exists, so a wheel never precedes its binaries    #
+  #------------------------------------------------------------------------------------------#
+  pypi:
+    name: publish to PyPI
+    needs: [release, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check that the tag matches the package version
+        # The wheel pulls the release tagged "v<version>", so the two must agree. Read
+        # the file as text: importing the package would need its dependencies installed.
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' tarquin_wrapper/_version.py)
+          [ "v${version}" = "${GITHUB_REF_NAME}" ] \
+            || { echo "tag ${GITHUB_REF_NAME} but _version.py says ${version}" >&2; exit 1; }
+
+      - name: Build sdist and wheel
+        run: pip install -q build && python -m build
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

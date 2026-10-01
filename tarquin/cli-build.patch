@@ -1,0 +1,65 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 8ea7baa..f1d3364 100755
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -6,13 +6,11 @@ cmake_minimum_required(VERSION 2.8)
+ #
+ # Setup platform specific paths for Linux
+ #
+-if( ${CMAKE_SYSTEM} MATCHES "Linux" )
++if( ${CMAKE_SYSTEM} MATCHES "Linux" OR MINGW )
+ 
+ 	add_definitions(-DPLATFORM_LINUX)
+ 
+ 	#add_definitions(-ffloat-store)
+-	add_definitions(-msse2)
+-	add_definitions(-mfpmath=sse)
+ 	add_definitions(-Wall)
+ 
+ 	set( BLAS_LIB   -lblas )
+@@ -52,12 +50,9 @@ if( ${CMAKE_SYSTEM_NAME} MATCHES "Darwin" )
+ 	#add_definitions(-mmacosx-version-min=10.5)
+ 	#add_definitions(-m32)
+ 	#add_definitions(-arch i386)
+-	add_definitions(-arch x86_64)
+ 	#add_definitions(-no_compact_linkedit)
+ 
+ 	#add_definitions(-ffloat-store)
+-	add_definitions(-msse2)
+-	add_definitions(-mfpmath=sse)
+ 	add_definitions(-Wall)
+ 
+ 	set( BLAS_LIB   -lblas )
+@@ -78,7 +73,7 @@ endif()
+ #
+ # Setup platform specific paths for Windows
+ #
+-if( WIN32 )
++if( MSVC )
+ 
+ 	add_definitions(-DPLATFORM_WINDOWS)
+     add_definitions(-DTIME_UTC_CHANGE)
+@@ -120,7 +115,6 @@ set(Boost_USE_MULTITHREADED ON)
+ # Changed by Nitram to allow a build on Ubuntu 8.04
+ find_package( 
+ 	Boost 1.46.0 REQUIRED COMPONENTS 
+-	unit_test_framework 
+ 	date_time 
+ 	filesystem 
+ 	system 
+@@ -196,7 +190,7 @@ add_subdirectory(version)
+ 
+ # on Windows we need the prebuilt version of cvmlib, because we
+ # can't afford the Fortran compiler
+-if( NOT WIN32 )
++if( NOT MSVC )
+ 	add_subdirectory(cvmlib/cvm)
+ 	set( CVM_INCLUDE ${CMAKE_SOURCE_DIR}/cvmlib/cvm/src)
+ 	set( CVM_LIB     cvm )
+@@ -212,6 +206,4 @@ add_subdirectory(levmar/levmar-2.5)
+ add_subdirectory(fast_sim)
+ add_subdirectory(common)
+ add_subdirectory(cmdline)
+-add_subdirectory(qtgui)
+-add_subdirectory(unit_tests)
+ add_subdirectory(generate_spectra)

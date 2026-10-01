@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tarquin_wrapper"
+dynamic = ["version"]
+description = "Lightweight Python wrapper for TARQUIN MRS fitting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+
+authors = [
+  { name = "Julian Merkofer", email = "j.p.merkofer@tue.nl" }
+]
+
+# Core stays light: no TARQUIN code or binary in the wheel. One is resolved on first
+# use - downloaded from this repo's releases, or run from the ghcr.io/julianmer/tarquin
+# image.
+dependencies = [
+  "numpy>=1.22",
+  "nibabel>=4.0",
+  "nifti-mrs>=1.0"
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "pandas>=1.4", "openpyxl>=3.0"]
+
+[project.urls]
+Homepage = "https://github.com/julianmer/PyTARQUIN"
+Repository = "https://github.com/julianmer/PyTARQUIN"
+
+[tool.setuptools.dynamic]
+version = { attr = "tarquin_wrapper._version.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tarquin_wrapper*"]

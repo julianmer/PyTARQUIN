@@ -1,0 +1,4 @@
+# a local build's work and output must not reach the image: build.sh would reuse them
+tarquin/work
+tarquin/dist
+.git

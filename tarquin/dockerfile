@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Builds a statically linked command-line TARQUIN for the target architecture.
+#
+# The image serves two purposes. CI extracts /usr/local/bin/tarquin with "docker create"
+# + "docker cp" and publishes it as a plain compressed binary - static linking (musl) is
+# what makes the extracted file run on any Linux of that architecture. The same image is
+# pushed to ghcr.io/julianmer/tarquin, where PyTARQUIN's container fallback
+# (tarquin_wrapper/container.py) runs it directly:
+#   docker run --rm -v "$PWD:$PWD" -w "$PWD" ghcr.io/julianmer/tarquin --input ...
+#
+# TARQUIN is a GPL-3.0 program by Greg Reynolds and Martin Wilson. It is fetched at a pinned
+# commit and built with tarquin/cli-build.patch (build system only: command line, no
+# x86-only flags); see tarquin/build.sh, and /licenses inside the image.
+#
+# Build:
+#   docker build -f tarquin/dockerfile -t tarquin-build .
+# Extract:
+#   cid=$(docker create tarquin-build) \
+#     && docker cp "$cid:/usr/local/bin/tarquin" ./tarquin && docker rm "$cid"
+
+ARG ALPINE_VERSION=3.22
+
+#--------------------------------------------------------------------------------------#
+#  stage 1: build Boost, FFTW, LAPACK and TARQUIN, all static                            #
+#--------------------------------------------------------------------------------------#
+FROM alpine:${ALPINE_VERSION} AS build
+
+RUN apk add --no-cache bash build-base gfortran cmake curl git tar xz linux-headers
+WORKDIR /pytarquin
+COPY tarquin/ tarquin/
+RUN tarquin/build.sh
+
+RUN mkdir -p /rootfs/usr/local/bin /rootfs/work /rootfs/tmp \
+ && cp tarquin/dist/tarquin /rootfs/usr/local/bin/tarquin \
+ && chmod 1777 /rootfs/tmp
+
+
+#--------------------------------------------------------------------------------------#
+#  stage 2: minimal carrier image                                                        #
+#--------------------------------------------------------------------------------------#
+FROM scratch
+
+COPY --from=build /rootfs/ /
+COPY LICENSE.tarquin NOTICE /licenses/
+
+LABEL org.opencontainers.image.title="TARQUIN" \
+      org.opencontainers.image.description="Command-line TARQUIN 4.3.11 by Greg Reynolds and Martin Wilson, built from github.com/martin3141/tarquin 47e9b98 with a build-system patch. Not affiliated with or endorsed by its authors." \
+      org.opencontainers.image.licenses="GPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/julianmer/PyTARQUIN" \
+      org.opencontainers.image.url="https://github.com/martin3141/tarquin"
+
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/tarquin"]

@@ -1,0 +1,3 @@
+[submodule "example_data/2016_fitting_challenge"]
+	path = example_data/2016_fitting_challenge
+	url = https://github.com/wtclarke/mrs_fitting_challenge

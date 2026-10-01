@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.env
+*.venv
+.venv/
+.env/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# TARQUIN builds (tarquin/build.sh)
+tarquin/work/
+tarquin/dist/
+
+# Test artifacts and the wrapper's default working directory
+tests/tmp/
+tmp/
+
+# System
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
