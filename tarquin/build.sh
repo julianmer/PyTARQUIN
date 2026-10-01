@@ -103,7 +103,8 @@ if [ ! -f "$deps/lib/libboost_filesystem.a" ]; then
     cmake -S "$work/boost-$BOOST_VERSION" -B "$work/boost-build" "${common[@]}" \
         -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
         -DBUILD_TESTING=OFF -DCMAKE_CXX_STANDARD=14 \
-        -DBOOST_INCLUDE_LIBRARIES="date_time;filesystem;system;thread"
+        -DBOOST_INCLUDE_LIBRARIES="date_time;filesystem;system;thread" \
+        -DBOOST_INSTALL_LAYOUT=system    # Windows defaults to include/boost-1_92 and decorated names
     cmake --build "$work/boost-build"
     cmake --install "$work/boost-build"
 fi
