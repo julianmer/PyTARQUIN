@@ -433,6 +433,8 @@ def test_the_container_runs_with_an_init():
 
 def test_mounts_never_include_the_root():
     """Docker refuses '/' as a mount point (a home of '/' under some service accounts)."""
+    if os.name == "nt":
+        pytest.skip("POSIX mounts")
     assert container.posix_mounts("/", "/") == []
     assert container.posix_mounts("/data/run", "/") == [("/data/run", "/data/run")]
 
