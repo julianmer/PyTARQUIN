@@ -27,6 +27,7 @@
 import argparse
 import ntpath
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -59,31 +60,30 @@ def to_container(path) -> str:
 def translate_args(args: List[str], mapper: Callable[[str], str] = to_container) -> List[str]:
     """Rewrite every file path among TARQUIN's arguments for the container.
 
-    A path is recognised by its drive letter ("C:\\..."), which no option value TARQUIN
-    takes otherwise has; on POSIX the mapper is the identity, so nothing changes.
+    A path is recognised by a drive letter and a separator ("C:\\..." or "C:/..."), which
+    no other value TARQUIN takes starts with; on POSIX the mapper is the identity.
     """
-    out = []
-    for arg in args:
-        drive = ntpath.splitdrive(arg)[0]
-        out.append(mapper(arg) if len(drive) == 2 and drive[1] == ":" else arg)
-    return out
+    return [mapper(arg) if re.match(r"[A-Za-z]:[\\/]", arg) else arg for arg in args]
 
 
 #***********************#
 #   mount computation   #
 #***********************#
 def posix_mounts(cwd: str, home: Optional[str]) -> List[Tuple[str, str]]:
-    """(host, container) pairs: the home directory, then the working directory and its
-    physical path (a symlinked cwd is reachable under both spellings), each unless it
-    already lies inside one before it - docker refuses a mount point twice, and the home
-    directory must stay visible as a whole, since the basis set and the wrapper's own run
-    folder live there."""
+    """(host, container) pairs: the home directory and the working directory, each under
+    its own spelling and its physical one (a symlinked home is common on clusters), each
+    unless it already lies inside one before it - docker refuses a mount point twice - and
+    never "/", which docker refuses outright. The home directory stays visible as a
+    whole, since the basis set and the wrapper's own run folder live there."""
     roots: List[str] = []
-    for path in (home, cwd, os.path.realpath(cwd)):
-        if path and not any(path == r or path.startswith(r.rstrip(os.sep) + os.sep)
-                            for r in roots):
+    for path in (home, home and os.path.realpath(home), cwd, os.path.realpath(cwd)):
+        if path and path != os.sep and not _inside(path, roots):
             roots.append(path)
     return [(r, r) for r in roots]
+
+
+def _inside(path: str, roots: List[str]) -> bool:
+    return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 
 
 def windows_mounts(cwd: str, home: Optional[str]) -> List[Tuple[str, str]]:
@@ -97,16 +97,14 @@ def windows_mounts(cwd: str, home: Optional[str]) -> List[Tuple[str, str]]:
 
 
 def can_see(path) -> bool:
-    """Would the launcher's mounts make "path" visible inside the container? Lets the
-    wrapper fail early with a clear message instead of TARQUIN reporting a missing file."""
+    """Would the launcher's mounts make "path", as its physical path, visible inside the
+    container? The wrapper hands TARQUIN physical paths, so this lets it fail early with a
+    clear message instead of TARQUIN reporting a missing file."""
     cwd, home = os.getcwd(), str(Path.home())
     if os.name == "nt":
         drive = ntpath.splitdrive(os.path.abspath(str(path)))[0].upper()
         return any(host.startswith(drive) for host, _ in windows_mounts(cwd, home))
-    p = Path(path).resolve()
-    roots = {Path(host).resolve() for host, _ in posix_mounts(cwd, home)}
-    roots.add(Path(os.environ.get("PWD", cwd)).resolve())
-    return any(p == root or root in p.parents for root in roots)
+    return _inside(os.path.realpath(path), [host for host, _ in posix_mounts(cwd, home)])
 
 
 #********************#
@@ -120,7 +118,9 @@ def run_command(cli: str, image: str, args: List[str], cwd: Optional[str] = None
     home = home if home is not None else str(Path.home())
     windows = os.name == "nt" if windows is None else windows
 
-    cmd = [cli, "run", "--rm"]
+    # --init: TARQUIN as the container's first process would ignore SIGINT and SIGTERM, so
+    # neither Ctrl-C nor the wrapper's timeout would stop it
+    cmd = [cli, "run", "--rm", "--init"]
     if windows:
         mounts = windows_mounts(cwd, home)
         workdir = windows_to_container(cwd)

@@ -217,13 +217,40 @@ def _serve(monkeypatch, payload, digest):
     monkeypatch.setattr(binaries, "_release_assets", lambda: ["tarquin-linux-x86_64.xz"])
 
 
+_FAKE = b"#!/bin/sh\necho 'TARQUIN 4.3.11 Started'\n"
+
+
 def test_release_download_installs_a_verified_binary(monkeypatch, tmp_path):
-    payload = lzma.compress(b"#!/bin/sh\necho not really\n")
+    if os.name == "nt":
+        pytest.skip("POSIX shell script")
+    payload = lzma.compress(_FAKE)
     _serve(monkeypatch, payload, hashlib.sha256(payload).hexdigest())
     got = binaries._download_release_binary(tmp_path)
     assert got == tmp_path / binaries._exec_name()
-    assert got.read_bytes() == b"#!/bin/sh\necho not really\n"
+    assert got.read_bytes() == _FAKE
     assert os.access(got, os.X_OK)
+
+
+def test_a_release_binary_that_does_not_run_gives_the_next_its_turn(monkeypatch, tmp_path):
+    """Apple silicon lists the Intel build after its own: one that downloads but does not
+    run must not end the search."""
+    if os.name == "nt":
+        pytest.skip("POSIX shell script")
+    payloads = {"arm.xz": lzma.compress(b"#!/bin/sh\nexit 0\n"), "intel.xz": lzma.compress(_FAKE)}
+
+    def fake_download(url, dest):
+        name = url.split("/")[-1]
+        if name.endswith(".sha256"):
+            dest.write_text(hashlib.sha256(payloads[name[:-7]]).hexdigest())
+        else:
+            dest.write_bytes(payloads[name])
+    monkeypatch.setattr(binaries, "_download", fake_download)
+    monkeypatch.setattr(binaries, "_release_assets", lambda: ["arm.xz", "intel.xz"])
+    monkeypatch.setenv("TARQUIN_CACHE_DIR", str(tmp_path / "root"))
+
+    got = binaries._download_release_binary(tmp_path)
+    assert got.read_bytes() == _FAKE
+    assert len(list((tmp_path / "root" / "quarantine").iterdir())) == 1
 
 
 def test_release_download_rejects_a_bad_checksum(monkeypatch, tmp_path):
@@ -271,7 +298,7 @@ def test_shim_forwards_tarquins_arguments_and_mounts_cwd_at_the_same_path(tmp_pa
 
     args = log.read_text().splitlines()
     cwd = os.path.realpath(work)
-    assert args[:2] == ["run", "--rm"]
+    assert args[:3] == ["run", "--rm", "--init"]
     assert args[-5:] == ["img:v1", "--input", f"{work}/in dpt.dpt", "--format", "dpt"]
     assert args[args.index("-w") + 1] in (str(work), cwd)
     mounts = [args[j + 1] for j, a in enumerate(args) if a == "-v"]
@@ -328,17 +355,17 @@ def test_container_can_see_only_cwd_and_home(tmp_path, monkeypatch):
         d.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(work)
-    monkeypatch.setenv("PWD", str(work))
     assert container.can_see(work / "tmp" / "temp0.dpt")
     assert container.can_see(home / "basis" / "x.basis")
     assert container.can_see(home)
     assert not container.can_see(other / "x.basis")
     # a working directory inside $HOME does not narrow what is seen to itself
-    monkeypatch.chdir(home / ".." / "home")
     (home / "project").mkdir()
     monkeypatch.chdir(home / "project")
-    monkeypatch.setenv("PWD", str(home / "project"))
     assert container.can_see(home / ".cache" / "tarquin_wrapper" / "runs" / "temp0.dpt")
+    # a stale $PWD names no mount
+    monkeypatch.setenv("PWD", str(other))
+    assert not container.can_see(other / "x.basis")
 
 
 def test_cached_shim_is_skipped_not_quarantined_when_engine_is_down(tmp_path, monkeypatch):
@@ -389,6 +416,37 @@ def test_arguments_with_a_drive_letter_are_translated_and_nothing_else():
                    "--auto_phase", "true"]
 
 
+def test_only_drive_paths_are_translated():
+    """A value with a colon is no path unless a separator follows the drive letter."""
+    args = ["--title", "T:2 weighted", "--input", "C:/data/x.dpt", "--x", "C:rel\\x.dpt"]
+    out = container.translate_args(args, mapper=container.windows_to_container)
+    assert out == ["--title", "T:2 weighted", "--input", "/host/C/data/x.dpt", "--x",
+                   "C:rel\\x.dpt"]
+
+
+def test_the_container_runs_with_an_init():
+    """TARQUIN as the container's first process ignores SIGTERM and SIGINT; with an init
+    in front, Ctrl-C and the wrapper's timeout stop it."""
+    assert "--init" in container.run_command("docker", "img", [], cwd="/data", home="/home/me",
+                                             windows=False)
+
+
+def test_mounts_never_include_the_root():
+    """Docker refuses '/' as a mount point (a home of '/' under some service accounts)."""
+    assert container.posix_mounts("/", "/") == []
+    assert container.posix_mounts("/data/run", "/") == [("/data/run", "/data/run")]
+
+
+def test_a_symlinked_home_is_mounted_under_both_spellings(tmp_path):
+    real = tmp_path / "gpfs" / "me"
+    real.mkdir(parents=True)
+    (tmp_path / "home").mkdir()
+    link = tmp_path / "home" / "me"
+    link.symlink_to(real)
+    mounts = [host for host, _ in container.posix_mounts(str(link / "run"), str(link))]
+    assert str(link) in mounts and str(real) in mounts
+
+
 def test_translation_is_identity_on_posix():
     if os.name == "nt":
         pytest.skip("identity mounts are the POSIX design")
@@ -401,7 +459,7 @@ def test_run_command_windows_mounts_drives_under_host():
     checked: drives of the cwd and home mounted at /host/<LETTER>, paths translated."""
     cmd = container.run_command("docker", "img:v1", ["--input", r"D:\proj\run\temp0.dpt"],
                                 cwd=r"D:\proj\run", home=r"C:\Users\me", windows=True)
-    assert cmd[:3] == ["docker", "run", "--rm"]
+    assert cmd[:4] == ["docker", "run", "--rm", "--init"]
     assert "-u" not in cmd                                   # no uid mapping on Windows
     mounts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-v"]
     assert mounts == ["D:\\:/host/D", "C:\\:/host/C"]
@@ -439,10 +497,13 @@ def test_container_rung_is_opt_out(monkeypatch, tmp_path):
 #******************#
 #   cache layout   #
 #******************#
-def test_cache_dir_is_architecture_keyed(monkeypatch, tmp_path):
+def test_cache_dir_is_release_and_architecture_keyed(monkeypatch, tmp_path):
+    """After an upgrade, or with TARQUIN_RELEASE_TAG, the binary of that release is used,
+    not one cached for another."""
     monkeypatch.setenv("TARQUIN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("TARQUIN_RELEASE_TAG", "v9.9.9")
     cache = binaries._cache_dir()
-    assert cache.parent == tmp_path
+    assert cache.parent == tmp_path / "v9.9.9"
     assert platform.system().lower() in cache.name
     assert binaries._normalized_machine() in cache.name
 
@@ -475,6 +536,63 @@ def test_resolve_rejects_an_unrunnable_explicit_path(tmp_path):
         binaries.resolve_executable(path2exec=str(bad))
 
 
-def test_resolve_still_rejects_a_missing_explicit_path(tmp_path):
-    with pytest.raises(FileNotFoundError):
+def test_resolve_still_rejects_a_missing_explicit_path(tmp_path, monkeypatch):
+    with pytest.raises(FileNotFoundError, match="path2exec does not exist"):
         binaries.resolve_executable(path2exec=str(tmp_path / "nope"))
+    monkeypatch.setenv("TARQUIN_EXEC", str(tmp_path / "nope"))   # named as it was given
+    with pytest.raises(FileNotFoundError, match="TARQUIN_EXEC does not exist"):
+        binaries.resolve_executable()
+
+
+def test_a_tarquin_on_path_is_used_and_never_quarantined(tmp_path, monkeypatch):
+    """A distribution's TARQUIN (snap, AUR) is found on PATH; one that does not run is
+    passed over but left where it is, since it is not ours to move."""
+    if os.name == "nt":
+        pytest.skip("POSIX shell script")
+    monkeypatch.delenv("TARQUIN_EXEC", raising=False)
+    monkeypatch.setenv("TARQUIN_CACHE_DIR", str(tmp_path / "cache"))
+    good = tmp_path / "good"
+    good.mkdir()
+    (good / "tarquin").write_bytes(_FAKE)
+    os.chmod(good / "tarquin", 0o755)
+    monkeypatch.setenv("PATH", str(good))
+    assert binaries.resolve_executable(allow_download=False, allow_docker=False) == \
+        str((good / "tarquin").resolve())
+
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    (bad / "tarquin").write_text("#!/bin/sh\nexit 0\n")
+    os.chmod(bad / "tarquin", 0o755)
+    monkeypatch.setenv("PATH", str(bad))
+    with pytest.raises(RuntimeError, match="PATH: ran"):
+        binaries.resolve_executable(allow_download=False, allow_docker=False)
+    assert (bad / "tarquin").is_file()
+
+
+def test_no_container_means_no_cached_shim_either(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("shim is POSIX only")
+    binaries._write_shim(tmp_path, "docker", "img")
+    monkeypatch.setattr(binaries, "_container_cli", lambda: "docker")
+    monkeypatch.setattr(binaries, "_container_ready", lambda cli, timeout=30.0: (True, "ok"))
+    assert binaries._cached_binary(tmp_path, allow_docker=False) is None
+    assert binaries.is_container_shim(binaries._cached_binary(tmp_path))
+
+
+#*************#
+#   version   #
+#*************#
+def test_the_version_is_read_from_the_start_line(tmp_path):
+    if os.name == "nt":
+        pytest.skip("POSIX shell script")
+    fake = tmp_path / "tarquin"
+    fake.write_bytes(_FAKE)
+    os.chmod(fake, 0o755)
+    assert binaries.version(fake) == "4.3.11"
+    assert binaries.version(sys.executable) is None
+    assert binaries.version(tmp_path / "missing") is None
+
+
+@pytest.mark.skipif(_real_binary() is None, reason="no TARQUIN binary")
+def test_the_real_binary_names_its_release():
+    assert binaries.version(_real_binary()) == "4.3.11"

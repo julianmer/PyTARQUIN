@@ -19,12 +19,20 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from . import binaries, container, io
 from .results import Report, read_results
+
+# What PyTARQUIN writes on the command line itself, and the keyword that sets it instead
+_OWNED = {"input": None, "input_w": None, "format": None, "output_txt": None,
+          "fs": "bandwidth", "ft": "central_freq", "echo": "echo_time", "ref": "reference",
+          "basis_lcm": "path2basis"}
+
+# TARQUIN's .dpt reader takes at most this many points per FID, and reads more as averages
+_MAX_POINTS = 16384
 
 
 #**************************************************************************************************#
@@ -66,7 +74,9 @@ class PyTARQUIN:
         TARQUIN's command line options by name, e.g. {"pul_seq": "slaser",
         "max_iters": 50, "auto_phase": False}; booleans become TARQUIN's 'true'/'false'.
         Anything not given is TARQUIN's own default - PRESS, and a start point it picks
-        itself, skipping about the first 10 ms of the FID to keep broad baseline out.
+        itself, skipping about the first 10 ms of the FID to keep broad baseline out. What
+        PyTARQUIN writes itself (input, format, fs, ft, echo, ref, basis_lcm, ...) is set
+        through its keywords instead.
     multiprocessing : bool
         Fit the batch across multiple processes.
     conj : bool
@@ -80,14 +90,15 @@ class PyTARQUIN:
         (cache -> release download -> container); the TARQUIN_EXEC environment variable
         is equivalent to passing it.
     domain : {"time", "freq"}
-        Domain of the input data passed at fit time. Defaults to "time" (FIDs).
+        Domain of the input data (and of the water reference) passed at fit time:
+        "time" for FIDs (the default), "freq" for spectra in np.fft.fft order (unshifted).
     bandwidth, central_freq : float, optional
         Hz and MHz; override what the data carries, and are required for data that
         carries neither (NumPy arrays, ".RAW").
     echo_time : float, optional
         Seconds; overrides the data's. TARQUIN simulates its internal basis at it.
     reference : float, optional
-        ppm at the transmitter frequency; overrides the data's, 4.65 when neither says.
+        ppm at the centre of the spectrum; overrides the data's, 4.65 when neither says.
     allow_download, allow_docker : bool
         Permit automatic binary download / container use during resolution. With a
         container (docker or podman), TARQUIN runs from an image and only sees the working
@@ -107,7 +118,12 @@ class PyTARQUIN:
         # TARQUIN 4.3.11 crashes on a basis file that is not there, rather than saying so
         if path2basis is not None and not os.path.isfile(path2basis):
             raise FileNotFoundError(f"no basis set at {path2basis}")
-        self.path2basis = None if path2basis is None else os.path.abspath(str(path2basis))
+        owned = sorted(set(opts or {}) & set(_OWNED))
+        if owned:
+            raise ValueError(f"PyTARQUIN sets {owned} itself; use its keywords "
+                             f"{[_OWNED[k] for k in owned if _OWNED[k]] or 'none'} instead")
+        # physical paths throughout, which is how a container sees them (see container.py)
+        self.path2basis = None if path2basis is None else os.path.realpath(path2basis)
         self.opts = dict(opts or {})
         self.multiprocessing = multiprocessing
         self.conj = conj
@@ -143,15 +159,16 @@ class PyTARQUIN:
         temporary folder per call - under the cache in the home directory when TARQUIN
         runs from a container, which sees no system temporary folder."""
         if self.save_path:
-            path = os.path.abspath(self.save_path)
-            os.makedirs(path, exist_ok=True)
+            os.makedirs(self.save_path, exist_ok=True)
+            path = os.path.realpath(self.save_path)
             self._check_visible(path, "save_path")
             return path
         parent = None
         if self._containerised:
             parent = binaries._cache_root() / "runs"
             parent.mkdir(parents=True, exist_ok=True)
-        return tempfile.mkdtemp(prefix="tarquin_", dir=parent)
+            self._check_visible(parent, "the run folder under TARQUIN_CACHE_DIR")
+        return os.path.realpath(tempfile.mkdtemp(prefix="tarquin_", dir=parent))
 
     def _acquisition(self, signals: io.Signals) -> Dict[str, float]:
         """What the ".dpt" header states: given values first, then the data's own."""
@@ -204,23 +221,29 @@ class PyTARQUIN:
         """
         signals = io.load_signals(x, domain=self.domain)
         fids = np.conjugate(signals.fids) if self.conj else signals.fids
+        _check_points(fids)
+        acquisition = self._acquisition(signals)
 
-        water = None
+        water, water_acquisition = None, None
         if x_ref is not None:
-            water = io.load_signals(x_ref, domain="time").fids
-            if self.conj:
-                water = np.conjugate(water)
+            reference = io.load_signals(x_ref, domain=self.domain)
+            water = np.conjugate(reference.fids) if self.conj else reference.fids
+            _check_points(water)
             # one reference per spectrum, which is how they are acquired; scaling a batch of
             # separate acquisitions by one subject's water would be wrong without being
             # visibly wrong
             if water.shape[0] != fids.shape[0]:
                 raise ValueError(f"{water.shape[0]} water references for {fids.shape[0]} "
                                  f"spectra; supply one per spectrum.")
+            # the reference's own sampling where it states it, else the data's
+            water_acquisition = dict(acquisition, **{
+                key: value for key, value in (("dwell", reference.dwell),
+                                              ("central_freq", reference.central_freq))
+                if value})
 
-        acquisition = self._acquisition(signals)
         path = self._workdir()
-        tasks = [(fid, None if water is None else water[i], acquisition, i, path)
-                 for i, fid in enumerate(fids)]
+        tasks = [(fid, None if water is None else water[i], acquisition, i, path,
+                  water_acquisition) for i, fid in enumerate(fids)]
         try:
             if self.multiprocessing:
                 with mp.Pool() as pool:
@@ -238,13 +261,18 @@ class PyTARQUIN:
     #   one fit   #
     #*************#
     def tarquin_forward(self, fid, h2o, acquisition: Dict[str, float], idx: int,
-                        path: str) -> Report:
+                        path: str, h2o_acquisition: Optional[Dict[str, float]] = None) -> Report:
         """Fit one FID (already in TARQUIN's orientation) and parse its results."""
         stem = os.path.join(path, f"temp{idx}")
+        # a kept save_path may hold an earlier run's results, which a failed run must not
+        # pass off as its own
+        for old in (f"{stem}.txt", f"{stem}_w.dpt"):
+            if os.path.exists(old):
+                os.remove(old)
         io.to_dpt(fid, f"{stem}.dpt", **acquisition)
         args = ["--input", f"{stem}.dpt", "--format", "dpt", "--output_txt", f"{stem}.txt"]
         if h2o is not None:
-            io.to_dpt(h2o, f"{stem}_w.dpt", **acquisition)
+            io.to_dpt(h2o, f"{stem}_w.dpt", **(h2o_acquisition or acquisition))
             args += ["--input_w", f"{stem}_w.dpt"]
         if self.path2basis is not None:
             args += ["--basis_lcm", self.path2basis]
@@ -263,12 +291,20 @@ class PyTARQUIN:
     #**************#
     def initiate(self, args: List[str]) -> str:
         """Run TARQUIN with these arguments. Returns whatever it printed."""
-        try:
-            proc = subprocess.run([self.path2exec, *args], capture_output=True,
-                                  stdin=subprocess.DEVNULL, timeout=self.timeout)
-        except subprocess.TimeoutExpired:
-            raise TARQUINError(f"TARQUIN did not finish within {self.timeout:g}s.") from None
-        return (proc.stdout + proc.stderr).decode("utf-8", errors="ignore")
+        with subprocess.Popen([self.path2exec, *args], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as proc:
+            try:
+                out, _ = proc.communicate(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                # terminate first: the container launcher passes it on to the container,
+                # which a kill of the launcher would leave running
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise TARQUINError(f"TARQUIN did not finish within {self.timeout:g}s.") from None
+        return out.decode("utf-8", errors="ignore")
 
 
 #************#
@@ -276,4 +312,16 @@ class PyTARQUIN:
 #************#
 def _option(value: Any) -> str:
     """An option value as TARQUIN reads it: only the exact string 'true' is true."""
-    return str(value).lower() if isinstance(value, bool) else str(value)
+    return str(value).lower() if isinstance(value, (bool, np.bool_)) else str(value)
+
+
+#******************#
+#   check points   #
+#******************#
+def _check_points(fids: np.ndarray):
+    """FIDs TARQUIN can read from a .dpt: some samples, and no more than it takes."""
+    if fids.shape[-1] == 0:
+        raise ValueError("the data holds no samples")
+    if fids.shape[-1] > _MAX_POINTS:
+        raise ValueError(f"{fids.shape[-1]} points; TARQUIN reads at most {_MAX_POINTS} per "
+                         f"FID from a .dpt (it takes more for averages), so truncate the FID")

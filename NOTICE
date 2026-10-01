@@ -19,10 +19,15 @@ from these sources, and the GPL-3.0 applies to every one of them:
   - binaries and the container image ghcr.io/julianmer/tarquin built by this
     repository's CI (.github/workflows/tarquin-binaries.yml) from
     github.com/martin3141/tarquin at commit 47e9b98263bf27f5a732445b1a13121005326b09
-    (TARQUIN 4.3.11), modified only in its build system by tarquin/cli-build.patch
-    (command line only, no x86-only compiler flags, MinGW builds; 2026-10-01).
-    Each release carries LICENSE.tarquin, this NOTICE and the complete
-    corresponding source: that commit, the patch and the build scripts.
+    (TARQUIN 4.3.11), modified only in how it is built: tarquin/cli-build.patch
+    (command line only, no x86-only compiler flags, MinGW builds) and the compiler and
+    linker flags in tarquin/build.sh (2026-10-01). They link Boost, FFTW and reference
+    LAPACK statically, and the C and C++ runtimes of their platforms; see
+    THIRD-PARTY-NOTICES for those components and their licences.
+    Each release carries LICENSE.tarquin, this NOTICE, THIRD-PARTY-NOTICES and the
+    complete corresponding source: that commit, the patch, the build scripts and the
+    sources of Boost, FFTW and LAPACK.
+  - a TARQUIN of your own, named with TARQUIN_EXEC or found on PATH.
 
 The build scripts and the patch in tarquin/ are part of that corresponding source
 and are licensed under the GNU General Public License, version 3, as TARQUIN is.

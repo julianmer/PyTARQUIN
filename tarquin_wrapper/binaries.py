@@ -8,9 +8,10 @@
 #                                                                                                  #
 # Purpose: Resolution of the TARQUIN executable. The wrapper does NOT ship binaries; it resolves   #
 #          one at run time in priority order: an explicit "path2exec" (or TARQUIN_EXEC), a         #
-#          previously cached download, a download of the CI-built binary attached to the           #
-#          PyTARQUIN release of this version, or a container image (docker/podman) behind a        #
-#          launcher script that behaves like a native executable (see container.py).               #
+#          TARQUIN on PATH, a previously cached download, a download of the CI-built binary        #
+#          attached to the PyTARQUIN release of this version, or a container image                 #
+#          (docker/podman) behind a launcher script that behaves like a native executable (see     #
+#          container.py).                                                                          #
 #                                                                                                  #
 #          Every candidate is exercised before it is accepted (see "verify_executable"), so a      #
 #          wrong-architecture download can never be cached and served forever.                     #
@@ -151,13 +152,14 @@ def _cache_root() -> Path:
 
 
 def _cache_dir() -> Path:
-    """Per-architecture cache directory.
+    """Per-release, per-architecture cache directory.
 
-    Keyed by architecture so a home directory shared across a mixed-architecture cluster
-    (an x86_64 login node and aarch64 compute nodes, say) does not have both fighting
-    over one file.
+    Keyed by the release, so a wheel runs the binary built alongside it also after an
+    upgrade, and by architecture, so a home directory shared across a mixed-architecture
+    cluster (an x86_64 login node and aarch64 compute nodes, say) does not have both
+    fighting over one file.
     """
-    base = _cache_root() / f"{platform.system().lower()}-{_normalized_machine()}"
+    base = _cache_root() / _release_tag() / f"{platform.system().lower()}-{_normalized_machine()}"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -205,7 +207,7 @@ def _quarantine(path: Path, reason: str = "unknown") -> Optional[Path]:
 #*************************#
 # TARQUIN logs "TARQUIN <version> Started" before it reads any argument, so "--help"
 # identifies it (and then exits 255).
-_HEALTH_MARKER = re.compile(rb"TARQUIN \S+ Started")
+_HEALTH_MARKER = re.compile(rb"TARQUIN (\S+) Started")
 
 _VERIFY_TIMEOUT = 60.0
 
@@ -294,21 +296,38 @@ def _probe(path: Path, timeout: float) -> Tuple[bool, str]:
                    f"first output was {out[:120]!r}")
 
 
+#*************#
+#   version   #
+#*************#
+def version(path) -> Optional[str]:
+    """The release a TARQUIN binary (or container launcher) names in its start line, e.g.
+    "4.3.11", or None when it names none."""
+    with tempfile.TemporaryDirectory() as cwd:
+        try:
+            proc = subprocess.run([str(path), "--help"], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  timeout=_VERIFY_TIMEOUT, cwd=cwd)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    found = _HEALTH_MARKER.search(proc.stdout or b"")
+    return found.group(1).decode() if found else None
+
+
 #*******************#
 #   download path   #
 #*******************#
 def _download(url: str, dest: Path):
     print(f"[tarquin_wrapper] Downloading TARQUIN binary from {url}")
     req = urllib.request.Request(url, headers={"User-Agent": "tarquin_wrapper"})
-    with urllib.request.urlopen(req) as resp, open(dest, "wb") as out:
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
         shutil.copyfileobj(resp, out)
 
 
 def _fetch_and_install(url: str, sha256_url: str, cache: Path) -> Path:
     """Download one xz-compressed binary, verify its checksum, extract and install it.
 
-    A release asset is a plain URL anyone with write access could re-upload, so the hash
-    from the CI run that built and tested it is what ties the file to that run.
+    The sidecar comes from the same release as the file, so the hash proves that the
+    file arrived whole, not who uploaded it.
     """
     with tempfile.TemporaryDirectory(dir=cache) as tmp:
         tmp = Path(tmp)
@@ -333,8 +352,13 @@ def _release_assets() -> List[str]:
     return [_RELEASE_ASSETS[key] for key in _platform_keys()]
 
 
-def _download_release_binary(cache: Path) -> Optional[Path]:
-    """Fetch the CI-built binary attached to the PyTARQUIN release of this version."""
+def _download_release_binary(cache: Path, verify: bool = True) -> Optional[Path]:
+    """Fetch the CI-built binary attached to the PyTARQUIN release of this version.
+
+    Each candidate is verified here, so one that downloads but does not run (the arm64
+    build on a machine it does not suit, say) gives the next one (the Intel build, through
+    Rosetta) its turn.
+    """
     assets = _release_assets()
     if not assets:
         return None
@@ -343,10 +367,17 @@ def _download_release_binary(cache: Path) -> Optional[Path]:
     for asset in assets:
         url = f"{base}/{asset}"
         try:
-            return _fetch_and_install(url, f"{url}.sha256", cache)
-        except Exception as err:   # try the next candidate (e.g. the Intel build on arm64)
+            got = _fetch_and_install(url, f"{url}.sha256", cache)
+        except Exception as err:
             last_err = err
             print(f"[tarquin_wrapper] Could not fetch {url}: {err}")
+            continue
+        ok, why = verify_executable(got) if verify else (True, "")
+        if ok:
+            return got
+        last_err = why
+        print(f"[tarquin_wrapper] Rejected {asset}: {why}")
+        _quarantine(got, reason="release")
 
     print(f"[tarquin_wrapper] Release binary download failed: {last_err}")
     return None
@@ -442,7 +473,7 @@ def _container_shim(cache: Path) -> Optional[Path]:
 #**********************#
 #   cache management   #
 #**********************#
-def _cached_binary(cache: Path) -> Optional[Path]:
+def _cached_binary(cache: Path, allow_docker: bool = True) -> Optional[Path]:
     cached = cache / _exec_name()
     if cached.is_file():
         return cached
@@ -452,7 +483,7 @@ def _cached_binary(cache: Path) -> Optional[Path]:
     # engine is simply not running right now, leave the shim in place and report
     # "unavailable" instead of quarantining a perfectly good script.
     shim = cache / _SHIM_NAME
-    if shim.is_file() and not os.environ.get("TARQUIN_NO_DOCKER"):
+    if shim.is_file() and allow_docker and not os.environ.get("TARQUIN_NO_DOCKER"):
         cli = _container_cli()
         if cli is None:
             return None
@@ -474,26 +505,28 @@ def resolve_executable(path2exec: Optional[str] = None,
                        allow_docker: bool = True) -> str:
     """Resolve a usable TARQUIN executable and return its absolute path.
 
-    Resolution order: explicit path -> cached -> release download -> container shim.
-    Every candidate is run once before being accepted, and anything that fails is
-    quarantined so the next source gets a turn instead of being shadowed by a broken file.
+    Resolution order: explicit path -> PATH -> cached -> release download -> container
+    shim. Every candidate is run once before being accepted, and anything of ours that
+    fails is quarantined so the next source gets a turn instead of being shadowed by a
+    broken file.
 
     Raises "RuntimeError" if no executable can be obtained.
     """
     # 1. explicit user path - verified, but never silently replaced. The environment
     #    variable is the same thing for code that does not pass the argument (CI
     #    pointing the test suite at a freshly built binary, a cluster-wide install).
+    source = "path2exec" if path2exec else "TARQUIN_EXEC"
     path2exec = path2exec or os.environ.get("TARQUIN_EXEC")
     if path2exec:
         p = Path(path2exec).expanduser()
         if not p.is_file():
-            raise FileNotFoundError(f"path2exec does not exist: {p}")
+            raise FileNotFoundError(f"{source} does not exist: {p}")
         if verify:
             ok, why = verify_executable(p)
             if not ok:
                 if why.startswith(("cannot execute", "killed by signal")):
                     raise RuntimeError(
-                        f"path2exec is not a runnable TARQUIN binary: {p}\n  {why}"
+                        f"{source} is not a runnable TARQUIN binary: {p}\n  {why}"
                     )
                 # It ran but did not identify itself - could legitimately be a wrapper
                 # script, so defer to the user who named it explicitly.
@@ -501,18 +534,27 @@ def resolve_executable(path2exec: Optional[str] = None,
                       f"({why}); using it anyway because it was passed explicitly.")
         return str(p.resolve())
 
+    # 2. a TARQUIN installed on PATH (a distribution's package, say) - used when it runs,
+    #    and never quarantined, since it is not ours to move
+    failures = []
+    on_path = shutil.which("tarquin")
+    if on_path:
+        ok, why = verify_executable(on_path) if verify else (True, "")
+        if ok:
+            return str(Path(on_path).resolve())
+        failures.append(f"PATH: {why}")
+
     cache = Path(cache_dir) if cache_dir else _cache_dir()
     cache.mkdir(parents=True, exist_ok=True)
 
     providers: List[Tuple[str, Callable[[], Optional[Path]]]] = [
-        ("cached", lambda: _cached_binary(cache)),
+        ("cached", lambda: _cached_binary(cache, allow_docker)),
     ]
     if allow_download:
-        providers.append(("release", lambda: _download_release_binary(cache)))
+        providers.append(("release", lambda: _download_release_binary(cache, verify)))
     if allow_docker:
         providers.append(("container", lambda: _container_shim(cache)))
 
-    failures = []
     for name, provide in providers:
         try:
             got = provide()
@@ -531,16 +573,17 @@ def resolve_executable(path2exec: Optional[str] = None,
                 continue
         return str(Path(got).resolve())
 
-    raise RuntimeError(_resolution_error(failures, allow_download, allow_docker))
+    raise RuntimeError(_resolution_error(failures, cache, allow_download, allow_docker))
 
 
-def _resolution_error(failures: List[str], allow_download: bool, allow_docker: bool) -> str:
+def _resolution_error(failures: List[str], cache: Path, allow_download: bool,
+                      allow_docker: bool) -> str:
     detail = "\n".join(f"    - {f}" for f in failures) or "    - no sources were tried"
     engine = _container_cli()
     return (
         "Could not resolve a working TARQUIN executable.\n"
         f"  platform: {platform.system()} {platform.machine()}\n"
-        f"  cache:    {_cache_dir()}\n"
+        f"  cache:    {cache}\n"
         "  tried:\n"
         f"{detail}\n"
         "Options:\n"

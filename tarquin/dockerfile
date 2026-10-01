@@ -43,7 +43,7 @@ RUN mkdir -p /rootfs/usr/local/bin /rootfs/work /rootfs/tmp \
 FROM scratch
 
 COPY --from=build /rootfs/ /
-COPY LICENSE.tarquin NOTICE /licenses/
+COPY LICENSE.tarquin NOTICE THIRD-PARTY-NOTICES /licenses/
 
 LABEL org.opencontainers.image.title="TARQUIN" \
       org.opencontainers.image.description="Command-line TARQUIN 4.3.11 by Greg Reynolds and Martin Wilson, built from github.com/martin3141/tarquin 47e9b98 with a build-system patch. Not affiliated with or endorsed by its authors." \

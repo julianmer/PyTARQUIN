@@ -19,6 +19,8 @@
 ####################################################################################################
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -36,19 +38,23 @@ class Signals:
     dwell: Optional[float] = None         # seconds
     central_freq: Optional[float] = None  # MHz
     echo_time: Optional[float] = None     # seconds
-    reference: Optional[float] = None     # ppm at the receiver frequency
+    reference: Optional[float] = None     # ppm at the centre of the spectrum
 
 
 def _stack(sigs: List[Signals], what: str) -> Signals:
-    """Concatenate a list of Signals along the batch axis; metadata from the first."""
+    """Concatenate a list of Signals along the batch axis. They must share their points
+    and acquisition parameters: one batch is written with one set of them."""
     if not sigs:
         raise ValueError(f"No {what} to load.")
-    n_points = sigs[0].fids.shape[-1]
-    for s in sigs:
-        if s.fids.shape[-1] != n_points:
-            raise ValueError(f"{what} have mismatched point counts: "
-                             f"{n_points} vs {s.fids.shape[-1]}.")
     first = sigs[0]
+    for s in sigs:
+        if s.fids.shape[-1] != first.fids.shape[-1]:
+            raise ValueError(f"{what} have mismatched point counts: "
+                             f"{first.fids.shape[-1]} vs {s.fids.shape[-1]}.")
+        for name in ("dwell", "central_freq", "echo_time", "reference"):
+            a, b = getattr(first, name), getattr(s, name)
+            if (a is None) != (b is None) or (a is not None and not np.isclose(a, b)):
+                raise ValueError(f"{what} differ in {name} ({a} vs {b}); fit them apart.")
     return Signals(fids=np.concatenate([s.fids for s in sigs], axis=0), dwell=first.dwell,
                    central_freq=first.central_freq, echo_time=first.echo_time,
                    reference=first.reference)
@@ -151,18 +157,21 @@ def _signals_from_nifti_mrs(nmrs) -> Signals:
     central_freq = float(sf[0]) if sf is not None and len(sf) > 0 else None
     hdr = getattr(nmrs, "hdr_ext", None)
     echo_time = float(hdr["EchoTime"]) if hdr is not None and "EchoTime" in hdr else None
-    reference = getattr(nmrs, "SpecFreqChemShift", None)
+    # the centre of the spectrum, where nifti-mrs puts it too: SpecFreqChemShift + RxOffset
+    shift = getattr(nmrs, "SpecFreqChemShift", None)
+    reference = None if shift is None else float(shift) + float(getattr(nmrs, "RxOffset", 0))
     return Signals(fids=_fids_from_nifti(np.asarray(nmrs[:])), dwell=dwell,
-                   central_freq=central_freq, echo_time=echo_time,
-                   reference=None if reference is None else float(reference))
+                   central_freq=central_freq, echo_time=echo_time, reference=reference)
 
 
 def _read_nifti_mrs_nibabel(path: str) -> Signals:
     """Fallback NIfTI-MRS reader using nibabel directly.
 
     The dwell time is "pixdim[4]", read as-is (assumed seconds), and the data are
-    conjugated as the "nifti-mrs" package does on indexing, so both readers agree;
-    install "nifti-mrs" for standard-compliant reading.
+    conjugated as the "nifti-mrs" package does on indexing, so both readers agree, except
+    that a header without SpecFreqChemShift leaves the reference unset here (4.65 then)
+    where nifti-mrs takes the nucleus' usual one; install "nifti-mrs" for standard-compliant
+    reading.
     """
     import nibabel as nib
 
@@ -181,9 +190,12 @@ def _read_nifti_mrs_nibabel(path: str) -> Signals:
     if isinstance(freq, (list, tuple)):
         freq = freq[0]
     echo = meta.get("EchoTime")
+    shift = meta.get("SpecFreqChemShift")
     return Signals(fids=np.conj(_fids_from_nifti(data)), dwell=dwell,
                    central_freq=None if freq is None else float(freq),
-                   echo_time=None if echo is None else float(echo))
+                   echo_time=None if echo is None else float(echo),
+                   reference=None if shift is None else
+                   float(shift) + float(meta.get("RxOffset", 0)))
 
 
 def _nifti_header_extension(img) -> dict:
@@ -240,10 +252,11 @@ def jmrui_metadata(meta: dict) -> Tuple[Optional[float], Optional[float]]:
 
 
 def read_jmrui(path: str) -> Signals:
-    """Read a single jMRUI ".txt" FID file into a Signals object."""
+    """Read a jMRUI ".txt" FID file into a Signals object, one row per dataset in it."""
     fid, meta = read_jmrui_txt(path)
     dwell, central = jmrui_metadata(meta)
-    return Signals(fids=fid[np.newaxis, :], dwell=dwell, central_freq=central)
+    datasets = int(float(meta.get("DatasetsInFile", 1)))
+    return Signals(fids=fid.reshape(datasets, -1), dwell=dwell, central_freq=central)
 
 
 #*****************#
@@ -252,13 +265,16 @@ def read_jmrui(path: str) -> Signals:
 def load_signals(data, domain: str = "time", dwell: Optional[float] = None,
                  central_freq: Optional[float] = None) -> Signals:
     """Load MRS data from a NumPy array, NIfTI-MRS file or object, jMRUI ".txt" or ".RAW",
-    or a list of such files, stacked along the batch axis (metadata from the first).
+    or a list of such files or objects, stacked along the batch axis (they must share their
+    acquisition parameters).
 
-    "domain" describes the domain of the *input* ("time" for FIDs, "freq" for
-    spectra). The returned signals are always time-domain FIDs.
+    "domain" describes the domain of the *input*: "time" for FIDs, "freq" for spectra in
+    np.fft.fft order (unshifted). The returned signals are always time-domain FIDs.
     """
     if domain not in ("time", "freq"):
         raise ValueError("domain must be 'time' or 'freq'")
+    if isinstance(data, os.PathLike):
+        data = os.fspath(data)
 
     if isinstance(data, str):
         lower = data.lower()
@@ -271,8 +287,9 @@ def load_signals(data, domain: str = "time", dwell: Optional[float] = None,
             sig = Signals(fids=np.conj(from_raw(data))[np.newaxis, :])
         else:
             raise ValueError(f"Unsupported file type: {data}")
-    elif isinstance(data, (list, tuple)) and data and all(isinstance(p, str) for p in data):
-        sig = _stack([load_signals(p) for p in data], "files")
+    elif isinstance(data, (list, tuple)) and all(
+            isinstance(p, (str, os.PathLike)) or _is_nifti_mrs(p) for p in data):
+        sig = _stack([load_signals(p) for p in data], "inputs")
     elif _is_nifti_mrs(data):
         # already loaded: keep its dwell time and central frequency rather than making
         # the caller re-supply what the object already knows
@@ -294,18 +311,23 @@ def load_signals(data, domain: str = "time", dwell: Optional[float] = None,
 #   lcmodel .raw files   #
 #************************#
 def from_raw(path) -> np.ndarray:
-    """Read the complex points that follow the header namelists.
+    """Read the complex points of a ".RAW" file, as stored (LCModel's orientation).
 
-    The samples start after the last "$END" (which may close a line of header values,
-    and a ".RAW" may carry a $SEQPAR namelist before $NMID), and run on as the header's
-    FMTDAT says - often several (real, imag) pairs per line.
+    The samples follow the last namelist end ("$END", "&END" or a lone "/"), which may
+    close a line of header values, and run on as the header's FMTDAT says - often several
+    (real, imag) pairs per line.
     """
-    with open(path, "r") as fh:
-        text = fh.read()
-    end = text.upper().rfind("$END")
-    if end < 0:
+    with open(path, "r", errors="ignore") as fh:
+        lines = fh.read().splitlines()
+    ends = [i for i, line in enumerate(lines)
+            if re.search(r"[$&]END\b", line, re.IGNORECASE) or line.strip() == "/"]
+    if not ends:
         raise ValueError(f"{path}: no '$END' closes the header, so this is no LCModel .RAW")
-    values = np.array(text[end + 4:].split(), dtype=float)
+    values = [float(v.replace("D", "E").replace("d", "e"))
+              for line in lines[ends[-1] + 1:] for v in line.split()]
+    if len(values) % 2:
+        raise ValueError(f"{path}: {len(values)} values after the header, not (real, imag) pairs")
+    values = np.asarray(values, dtype=np.float64)
     return values[0::2] + 1j * values[1::2]
 
 
@@ -320,7 +342,7 @@ def to_dpt(fid, file_path, dwell: float, central_freq: float, reference: float =
     Args:
         dwell: Seconds between samples.
         central_freq: Transmitter frequency in MHz.
-        reference: ppm at the transmitter frequency.
+        reference: ppm at the centre of the spectrum.
         echo_time: Seconds; TARQUIN simulates its internal basis at it.
     """
     fid = np.asarray(fid).reshape(-1)

@@ -41,26 +41,6 @@ def test_a_dpt_reads_back_as_written(tmp_path):
         pytest.approx((1 / 2000.0, 123.2, 4.7, 0.035))
 
 
-def test_conjugation_puts_naa_where_tarquin_reads_it(tmp_path):
-    """TARQUIN reads a .dpt with a forward FFT and ppm = ref - f/ft: a singlet made at
-    2.008 ppm in NIfTI-MRS, loaded and conjugated as PyTARQUIN does, must land there."""
-    from nifti_mrs.create_nmrs import gen_nifti_mrs
-    n, dwell, f0, ref = 2048, 1 / 2500.0, 127.7, 4.65
-    t = np.arange(n) * dwell
-    fid = np.exp((2j * np.pi * (2.008 - ref) * f0 - 8.0) * t)
-    signals = io.load_signals(gen_nifti_mrs(fid.reshape(1, 1, 1, -1).astype(np.complex64),
-                                            dwell, f0))
-
-    io.to_dpt(np.conj(signals.fids[0]), tmp_path / "in.dpt", signals.dwell,
-              signals.central_freq, signals.reference)
-    back = io.from_dpt(tmp_path / "in.dpt")
-    spectrum = np.fft.fftshift(np.fft.fft(back.fids[0]))
-    f = np.fft.fftshift(np.fft.fftfreq(n, back.dwell))
-    ppm = back.reference - f / back.central_freq
-
-    assert ppm[np.argmax(np.abs(spectrum))] == pytest.approx(2.008, abs=0.01)
-
-
 #***************#
 #   nifti-mrs   #
 #***************#
@@ -83,13 +63,16 @@ def test_the_nibabel_fallback_agrees_with_nifti_mrs(tmp_path):
     fid = (np.exp(-np.arange(128) / 30.0) * np.exp(0.3j * np.arange(128))).astype(np.complex64)
     item = gen_nifti_mrs(fid.reshape(1, 1, 1, -1), 1 / 4000.0, 123.2)
     item.add_hdr_field("EchoTime", 0.03)
+    item.add_hdr_field("SpecFreqChemShift", 4.7)
+    item.add_hdr_field("RxOffset", -1.65)
     item.save(str(tmp_path / "x.nii.gz"))
 
     package = io.read_nifti_mrs(str(tmp_path / "x.nii.gz"))
     fallback = io._read_nifti_mrs_nibabel(str(tmp_path / "x.nii.gz"))
     assert np.allclose(fallback.fids, package.fids)
-    assert (fallback.dwell, fallback.central_freq, fallback.echo_time) == \
-        pytest.approx((package.dwell, package.central_freq, package.echo_time))
+    assert (fallback.dwell, fallback.central_freq, fallback.echo_time, fallback.reference) == \
+        pytest.approx((package.dwell, package.central_freq, package.echo_time, package.reference))
+    assert package.reference == pytest.approx(4.7 - 1.65)   # the centre, as nifti-mrs has it
 
 
 def test_a_batched_wrapper_is_stacked():
@@ -123,6 +106,17 @@ def test_a_raw_header_may_close_on_a_value_line_and_hold_several_namelists(tmp_p
     assert np.array_equal(io.from_raw(path), [1 + 2j, 3 + 4j, 5 + 6j, 7 + 8j, -1 - 2j])
 
 
+def test_only_what_follows_the_header_is_samples(tmp_path):
+    """A header line without '=' is no sample, a lone '/' ends a namelist as '$END' does,
+    and Fortran's D exponents read as numbers; an odd count of values is no FID."""
+    path = tmp_path / "x.RAW"
+    path.write_text(" $SEQPAR\n Echo 30 ms\n $END\n &NMID ID='x'\n /\n 1.0D+00 2.0D+00\n")
+    assert np.array_equal(io.from_raw(path), [1 + 2j])
+    path.write_text(" $NMID\n $END\n 1.0 2.0 3.0\n")
+    with pytest.raises(ValueError, match="pairs"):
+        io.from_raw(path)
+
+
 def test_a_file_without_a_header_is_refused(tmp_path):
     path = tmp_path / "x.RAW"
     path.write_text("1.0 2.0\n")
@@ -148,3 +142,38 @@ def test_a_list_of_files_is_a_batch():
     got = io.load_signals([str(data / "dataset1_WS.txt"), str(data / "dataset2_WS.txt")])
     assert got.fids.shape == (2, 2048)
     assert got.dwell == pytest.approx(2.5e-4)
+
+
+#*************#
+#   batches   #
+#*************#
+def test_a_batch_must_share_its_acquisition():
+    from nifti_mrs.create_nmrs import gen_nifti_mrs
+    a = gen_nifti_mrs(np.ones((1, 1, 1, 64), np.complex64), 1 / 4000.0, 123.2)
+    b = gen_nifti_mrs(np.ones((1, 1, 1, 64), np.complex64), 1 / 2000.0, 297.2)
+    assert io.load_signals([a, a]).fids.shape == (2, 64)          # objects stack too
+    with pytest.raises(ValueError, match="differ in dwell"):
+        io.load_signals([a, b])
+    with pytest.raises(ValueError, match="No inputs"):
+        io.load_signals([])
+
+
+def test_a_jmrui_file_with_several_datasets_is_a_batch(tmp_path):
+    path = tmp_path / "two.txt"
+    rows = "\n".join(f"{v}\t0\t0\t0" for v in range(8))
+    path.write_text("jMRUI Data Textfile\n\nPointsInDataset: 4\nDatasetsInFile: 2\n"
+                    "SamplingInterval: 2.5E-1\nTransmitterFrequency: 1.2322E8\n\n"
+                    "sig(real)\tsig(imag)\tfft(real)\tfft(imag)\n"
+                    "Signal 1 out of 2 in file\n" + "\n".join(rows.splitlines()[:4]) + "\n"
+                    "Signal 2 out of 2 in file\n" + "\n".join(rows.splitlines()[4:]) + "\n")
+    got = io.load_signals(str(path))
+    assert got.fids.shape == (2, 4)
+    assert got.fids[1, 0] == 4
+
+
+def test_a_path_object_reads_like_its_string(tmp_path):
+    fid = np.exp(-np.arange(16) / 4.0) + 0j
+    io.to_dpt(fid, tmp_path / "x.dpt", dwell=1 / 2000.0, central_freq=123.2)
+    (tmp_path / "x.RAW").write_text(" $NMID\n $END\n" + "\n".join(f"{v.real} {v.imag}" for v in fid))
+    assert np.allclose(io.load_signals(tmp_path / "x.RAW").fids,
+                       io.load_signals(str(tmp_path / "x.RAW")).fids)

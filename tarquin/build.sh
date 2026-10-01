@@ -14,7 +14,9 @@
 #          static). Boost and FFTW are built here as static libraries from checksummed sources;    #
 #          BLAS/LAPACK is Accelerate on macOS and reference LAPACK, built here, elsewhere.         #
 #          Needs cmake, ninja or make, a C/C++ compiler, gfortran (or $FC), curl, git and tar.     #
-#          Output: dist/tarquin (dist/tarquin.exe on Windows).                                     #
+#          Output: dist/tarquin (dist/tarquin.exe on Windows). "build.sh sources" only fetches     #
+#          the checksummed source archives into work/downloads, as a release's source archive      #
+#          carries them; beside an upstream/ tree (as there) no network is needed.                 #
 #                                                                                                  #
 ####################################################################################################
 set -euo pipefail
@@ -28,6 +30,9 @@ FFTW_VERSION=3.3.11
 FFTW_SHA256=5630c24cdeb33b131612f7eb4b1a9934234754f9f388ff8617458d0be6f239a1
 LAPACK_VERSION=3.12.1
 LAPACK_SHA256=2ca6407a001a474d4d4d35f3a61550156050c48016d949f0da0529c0aa052422
+FFTW_URL="https://www.fftw.org/fftw-$FFTW_VERSION.tar.gz"
+BOOST_URL="https://github.com/boostorg/boost/releases/download/boost-$BOOST_VERSION/boost-$BOOST_VERSION-cmake.tar.xz"
+LAPACK_URL="https://github.com/Reference-LAPACK/lapack/archive/refs/tags/v$LAPACK_VERSION.tar.gz"
 
 case "$(uname -s)" in
     Darwin)       os=macos ;;
@@ -80,13 +85,29 @@ fetch() {   # url sha256 -> path of the verified download
     echo "$file"
 }
 
+if [ "${1:-}" = sources ]; then
+    fetch "$FFTW_URL" "$FFTW_SHA256"
+    fetch "$BOOST_URL" "$BOOST_SHA256"
+    fetch "$LAPACK_URL" "$LAPACK_SHA256"
+    exit 0
+fi
+
+# what the dependencies were built with: anything else rebuilds them
+stamp="boost $BOOST_VERSION fftw $FFTW_VERSION lapack $LAPACK_VERSION cc $("$CC" -dumpversion)"
+stamp+=" fc $("$FC" -dumpversion) target ${MACOSX_DEPLOYMENT_TARGET:-}"
+if [ "$(cat "$deps/STAMP" 2>/dev/null)" != "$stamp" ]; then
+    rm -rf "$deps"
+    mkdir -p "$deps"
+    echo "$stamp" > "$deps/STAMP"
+fi
+
 
 #--------------------------------------------------------------------------------------------------#
 #  FFTW, static, plain C (no SIMD: a CI runner's vector units are not the user's)                  #
 #--------------------------------------------------------------------------------------------------#
 if [ ! -f "$deps/lib/libfftw3.a" ]; then
     rm -rf "$work/fftw-$FFTW_VERSION"
-    tar -xzf "$(fetch "https://www.fftw.org/fftw-$FFTW_VERSION.tar.gz" "$FFTW_SHA256")" -C "$work"
+    tar -xzf "$(fetch "$FFTW_URL" "$FFTW_SHA256")" -C "$work"
     (cd "$work/fftw-$FFTW_VERSION" \
         && ./configure --prefix="$deps" --disable-shared --enable-static --disable-fortran \
                        --disable-dependency-tracking CC="$CC" CFLAGS=-O3 \
@@ -99,7 +120,7 @@ fi
 #--------------------------------------------------------------------------------------------------#
 if [ ! -f "$deps/lib/libboost_filesystem.a" ]; then
     rm -rf "$work/boost-$BOOST_VERSION" "$work/boost-build"
-    tar -xJf "$(fetch "https://github.com/boostorg/boost/releases/download/boost-$BOOST_VERSION/boost-$BOOST_VERSION-cmake.tar.xz" "$BOOST_SHA256")" -C "$work"
+    tar -xJf "$(fetch "$BOOST_URL" "$BOOST_SHA256")" -C "$work"
     cmake -S "$work/boost-$BOOST_VERSION" -B "$work/boost-build" "${common[@]}" \
         -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
         -DBUILD_TESTING=OFF -DCMAKE_CXX_STANDARD=14 \
@@ -115,7 +136,7 @@ fi
 #--------------------------------------------------------------------------------------------------#
 if [ "$os" != macos ] && [ ! -f "$deps/lib/liblapack.a" ]; then
     rm -rf "$work/lapack-$LAPACK_VERSION" "$work/lapack-build"
-    tar -xzf "$(fetch "https://github.com/Reference-LAPACK/lapack/archive/refs/tags/v$LAPACK_VERSION.tar.gz" "$LAPACK_SHA256")" -C "$work"
+    tar -xzf "$(fetch "$LAPACK_URL" "$LAPACK_SHA256")" -C "$work"
     cmake -S "$work/lapack-$LAPACK_VERSION" -B "$work/lapack-build" "${common[@]}" \
         -DCMAKE_Fortran_COMPILER="$FC" -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
         -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DCBLAS=OFF -DLAPACKE=OFF \
@@ -130,9 +151,14 @@ fi
 #--------------------------------------------------------------------------------------------------#
 src="$work/tarquin"
 rm -rf "$src"
-git init -q "$src"
-git -C "$src" fetch -q --depth 1 "$TARQUIN_REPO" "$TARQUIN_REF"
-git -C "$src" -c advice.detachedHead=false checkout -q FETCH_HEAD
+if [ -d "$here/../upstream" ]; then
+    cp -R "$here/../upstream" "$src"     # a release's source archive: the commit, offline
+    git init -q "$src"
+else
+    git init -q "$src"
+    git -C "$src" fetch -q --depth 1 "$TARQUIN_REPO" "$TARQUIN_REF"
+    git -C "$src" -c advice.detachedHead=false checkout -q FETCH_HEAD
+fi
 git -C "$src" apply "$here/cli-build.patch"
 
 # -std=gnu++14: the code predates C++17; directory.hpp: newer Boost no longer pulls it in
@@ -200,9 +226,10 @@ case "$os" in
             echo "links a MinGW runtime DLL" >&2; exit 1
         fi ;;
 esac
-status=0
-(cd "$check" && "./$exe" --help > help.txt 2>&1) || status=$?
-grep -q "TARQUIN $TARQUIN_VERSION Started" "$check/help.txt" && [ "$status" -eq 255 ] \
-    || { cat "$check/help.txt" >&2; echo "--help exited $status" >&2; exit 1; }
+# after the usage TARQUIN tries to load an empty file name and fails, with an exit status
+# that differs by platform (255 on POSIX), so only its start line counts, as in binaries.py
+(cd "$check" && "./$exe" --help > help.txt 2>&1) || true
+grep -q "TARQUIN $TARQUIN_VERSION Started" "$check/help.txt" \
+    || { cat "$check/help.txt" >&2; echo "--help did not identify TARQUIN" >&2; exit 1; }
 rm -rf "$check"
 echo "portable: $dist/$exe ($os $(uname -m))"

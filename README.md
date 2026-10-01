@@ -3,7 +3,7 @@
   <p style="margin-top: 0px;"><em>A lightweight Python wrapper for TARQUIN spectral fitting in MR spectroscopy</em></p>
 
   [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-  [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+  [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](https://github.com/julianmer/PyTARQUIN/blob/main/LICENSE)
 </div>
 
 **PyTARQUIN** is a lightweight Python wrapper that streamlines the use of [TARQUIN](https://github.com/martin3141/tarquin) for MRS fitting. It handles flexible data input, writes TARQUIN's input files, manages the TARQUIN executable for you, and parses its results (with single- and multi-core processing).
@@ -38,12 +38,13 @@ example data used by the tests.
 TARQUIN is **not** shipped in the wheel. On first use it is found in this order, and the first one that works is cached:
 
 1. `path2exec` you pass to `PyTARQUIN` (or the `TARQUIN_EXEC` environment variable),
-2. the binary built by this repository's CI for the installed version ([releases](https://github.com/julianmer/PyTARQUIN/releases); Linux x86_64/aarch64 and Windows x86_64 statically linked, macOS arm64/x86_64 linking only the OS),
-3. the container image `ghcr.io/julianmer/tarquin`, if Docker or podman is running.
+2. a `tarquin` on your `PATH` (a distribution's package, say),
+3. the binary built by this repository's CI for the installed version ([releases](https://github.com/julianmer/PyTARQUIN/releases); Linux x86_64/aarch64 and Windows x86_64 statically linked, macOS arm64/x86_64 linking only the OS),
+4. the container image `ghcr.io/julianmer/tarquin`, if Docker or podman is running.
 
-Each candidate is run once before it is accepted, so a binary that cannot run on your machine is skipped rather than cached. Useful switches: `allow_download` and `allow_docker` on `PyTARQUIN`, and the `TARQUIN_EXEC` / `TARQUIN_CACHE_DIR` environment variables.
+Each candidate is run once before it is accepted, so a binary that cannot run on your machine is skipped rather than cached. Useful switches: `allow_download` and `allow_docker` on `PyTARQUIN`, and the environment variables `TARQUIN_EXEC` (a binary of your own), `TARQUIN_CACHE_DIR` (where downloads are kept), `TARQUIN_RELEASE_TAG` and `TARQUIN_DOCKER_IMAGE` (another release or image), and `TARQUIN_NO_DOCKER` (set to anything: never use a container).
 
-The binaries are TARQUIN 4.3.11, built from [martin3141/tarquin](https://github.com/martin3141/tarquin) at commit `47e9b98` with a small build-system patch ([`tarquin/`](tarquin/)); on the 2016 challenge they fit identically to the official 4.3.11 release. To build one yourself: `tarquin/build.sh` (macOS, Linux, or Windows under MSYS2 UCRT64).
+The binaries are TARQUIN 4.3.11, built from [martin3141/tarquin](https://github.com/martin3141/tarquin) at commit `47e9b98` with a small build-system patch ([`tarquin/`](https://github.com/julianmer/PyTARQUIN/blob/main/tarquin)); every build must reproduce the official 4.3.11 release on the 2016 challenge in CI, and the macOS and Linux builds fit it identically. To build one yourself: `tarquin/build.sh` (macOS, Linux, or Windows under MSYS2 UCRT64).
 
 With the container, TARQUIN sees your working directory and your home directory; keep the basis set and any `save_path` under one of them. The image also works on its own:
 ```bash
@@ -88,9 +89,9 @@ Data without acquisition parameters (NumPy arrays, `.RAW`) needs `bandwidth=` (H
 
 ## Licensing
 
-This wrapper (the Python code) is released under the **Apache License 2.0** (see [LICENSE](LICENSE)).
+This wrapper (the Python code) is released under the **Apache License 2.0** (see [LICENSE](https://github.com/julianmer/PyTARQUIN/blob/main/LICENSE)).
 
-**TARQUIN itself is a separate program**, (c) Greg Reynolds and Martin Wilson, distributed under the **GNU General Public License, version 3** (see [LICENSE.tarquin](LICENSE.tarquin)). This package does not bundle TARQUIN; when it downloads or runs the TARQUIN executable, that licence and the attributions in [NOTICE](NOTICE) apply. The build scripts and patch in [`tarquin/`](tarquin/) are part of the binaries' corresponding source and are GPL-3.0 as well; every release carries that source in full.
+**TARQUIN itself is a separate program**, (c) Greg Reynolds and Martin Wilson, distributed under the **GNU General Public License, version 3** (see [LICENSE.tarquin](https://github.com/julianmer/PyTARQUIN/blob/main/LICENSE.tarquin)). This package does not bundle TARQUIN; when it downloads or runs the TARQUIN executable, that licence and the attributions in [NOTICE](https://github.com/julianmer/PyTARQUIN/blob/main/NOTICE) apply, and those of the libraries the binaries link in [THIRD-PARTY-NOTICES](https://github.com/julianmer/PyTARQUIN/blob/main/THIRD-PARTY-NOTICES). The build scripts and patch in [`tarquin/`](https://github.com/julianmer/PyTARQUIN/blob/main/tarquin) are part of the binaries' corresponding source and are GPL-3.0 as well; every release carries that source in full.
 
 ---
 
