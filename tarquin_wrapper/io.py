@@ -333,7 +333,8 @@ def to_dpt(fid, file_path, dwell: float, central_freq: float, reference: float =
              f"Echo_time\t{echo_time:8.8e}",
              "Real_FID\tImag_FID\t"]
     lines += [f"{x.real:8.8e} {x.imag:8.8e}" for x in fid]
-    with open(file_path, "w") as fh:
+    # LF everywhere: a Windows host may hand the file to the Linux binary in the container
+    with open(file_path, "w", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
 
 

@@ -38,11 +38,14 @@ esac
 exe="tarquin$([ "$os" = windows ] && echo .exe || true)"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ "$os" = windows ]; then
-    here="$(cygpath -m "$here")"   # the native toolchain reads D:/..., not MSYS's /d/...
-fi
 work="$here/work"
 deps="$work/deps"
+# MSYS's own tools (tar, make) read /d/..., the native toolchain (cmake, gcc) D:/... -
+# which tar would take for a remote host - so paths inside native options are converted
+prefix="$deps"
+if [ "$os" = windows ]; then
+    prefix="$(cygpath -m "$deps")"
+fi
 dist="$here/dist"
 jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
 export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
@@ -98,7 +101,7 @@ if [ ! -f "$deps/lib/libboost_filesystem.a" ]; then
     rm -rf "$work/boost-$BOOST_VERSION" "$work/boost-build"
     tar -xJf "$(fetch "https://github.com/boostorg/boost/releases/download/boost-$BOOST_VERSION/boost-$BOOST_VERSION-cmake.tar.xz" "$BOOST_SHA256")" -C "$work"
     cmake -S "$work/boost-$BOOST_VERSION" -B "$work/boost-build" "${common[@]}" \
-        -DCMAKE_INSTALL_PREFIX="$deps" -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
         -DBUILD_TESTING=OFF -DCMAKE_CXX_STANDARD=14 \
         -DBOOST_INCLUDE_LIBRARIES="date_time;filesystem;system;thread"
     cmake --build "$work/boost-build"
@@ -113,7 +116,7 @@ if [ "$os" != macos ] && [ ! -f "$deps/lib/liblapack.a" ]; then
     rm -rf "$work/lapack-$LAPACK_VERSION" "$work/lapack-build"
     tar -xzf "$(fetch "https://github.com/Reference-LAPACK/lapack/archive/refs/tags/v$LAPACK_VERSION.tar.gz" "$LAPACK_SHA256")" -C "$work"
     cmake -S "$work/lapack-$LAPACK_VERSION" -B "$work/lapack-build" "${common[@]}" \
-        -DCMAKE_Fortran_COMPILER="$FC" -DCMAKE_INSTALL_PREFIX="$deps" -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_Fortran_COMPILER="$FC" -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
         -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DCBLAS=OFF -DLAPACKE=OFF \
         -DBUILD_INDEX64_EXT_API=OFF
     cmake --build "$work/lapack-build"
@@ -132,22 +135,25 @@ git -C "$src" -c advice.detachedHead=false checkout -q FETCH_HEAD
 git -C "$src" apply "$here/cli-build.patch"
 
 # -std=gnu++14: the code predates C++17; directory.hpp: newer Boost no longer pulls it in
-# through operations.hpp; finite (macOS): levmar's C uses the BSD name the SDK has dropped,
-# while glibc, musl and MinGW still declare it.
+# through operations.hpp; finite: levmar's C uses the BSD name, which the macOS SDK has
+# dropped for arm64 only - its x86_64 side, glibc, musl and MinGW still declare it.
 # -L deps/lib holds only archives, so -lfftw3 (and -lblas/-llapack off macOS) are static;
 # on macOS -lblas/-llapack resolve to Accelerate. Static reference LAPACK needs BLAS after
 # it (cvmlib names BLAS first, and a static link resolves in order) and the Fortran
 # runtime, which the standard libraries put last on the link line.
-flags=(-DCMAKE_CXX_FLAGS="-w -std=gnu++14 -include boost/filesystem/directory.hpp -I$deps/include")
+cflags="-w"
+if [ "$os" = macos ] && [ "$(uname -m)" = arm64 ]; then
+    cflags+=" -Dfinite=isfinite"
+fi
+flags=(-DCMAKE_C_FLAGS="$cflags"
+       -DCMAKE_CXX_FLAGS="-w -std=gnu++14 -include boost/filesystem/directory.hpp -I$prefix/include")
 if [ "$os" = macos ]; then
-    flags+=(-DCMAKE_C_FLAGS="-w -Dfinite=isfinite"
-            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
-            -DCMAKE_EXE_LINKER_FLAGS="-L$deps/lib")
+    flags+=(-DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+            -DCMAKE_EXE_LINKER_FLAGS="-L$prefix/lib")
 else
-    flags+=(-DCMAKE_C_FLAGS="-w")
     runtime="-lblas -lgfortran"
     [ "$("$FC" -print-file-name=libquadmath.a)" != libquadmath.a ] && runtime+=" -lquadmath"
-    link="-static -L$deps/lib"
+    link="-static -L$prefix/lib"
     # musl gives each thread 128 KB of stack, where glibc gives 8 MB; TARQUIN simulates its
     # internal basis in threads that need more, and musl takes the default from this
     if [ "$os" = linux ]; then
@@ -157,7 +163,7 @@ else
             -DCMAKE_CXX_STANDARD_LIBRARIES="$runtime")
 fi
 cmake -S "$src/src" -B "$src/build" "${common[@]}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-    -DCMAKE_Fortran_COMPILER="$FC" -DCMAKE_PREFIX_PATH="$deps" "${flags[@]}"
+    -DCMAKE_Fortran_COMPILER="$FC" -DCMAKE_PREFIX_PATH="$prefix" "${flags[@]}"
 cmake --build "$src/build" --target tarquin
 
 cp "$src/build/redist/$exe" "$dist/$exe"
