@@ -14,11 +14,11 @@
 #                                                                                                  #
 ####################################################################################################
 
-import multiprocessing as mp
 import os
 import shutil
 import subprocess
 import tempfile
+from multiprocessing.pool import ThreadPool
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -78,7 +78,7 @@ class PyTARQUIN:
         PyTARQUIN writes itself (input, format, fs, ft, echo, ref, basis_lcm, ...) is set
         through its keywords instead.
     multiprocessing : bool
-        Fit the batch across multiple processes.
+        Fit the batch in parallel, one TARQUIN process per CPU core at a time.
     conj : bool
         Conjugate the FIDs before fitting. Every loader hands out the orientation that
         NIfTI-MRS gives when indexed (and jMRUI text stores); TARQUIN wants the conjugate.
@@ -246,7 +246,10 @@ class PyTARQUIN:
                   water_acquisition) for i, fid in enumerate(fids)]
         try:
             if self.multiprocessing:
-                with mp.Pool() as pool:
+                # threads, each waiting on its own TARQUIN process: a process pool would
+                # re-run the caller's script in every worker (macOS, Windows, Linux from
+                # Python 3.14), which without a "__main__" guard never finishes
+                with ThreadPool() as pool:
                     reports = pool.starmap(self.tarquin_forward, tasks)
             else:
                 reports = [self.tarquin_forward(*task) for task in tasks]

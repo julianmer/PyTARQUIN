@@ -12,12 +12,15 @@
 ####################################################################################################
 
 import os
+import subprocess
 import sys
+import textwrap
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, _REPO)
 
 from tarquin_wrapper import PyTARQUIN, TARQUINError, binaries, io
 from tarquin_wrapper import core
@@ -124,6 +127,32 @@ def test_forward_orders_by_tarquins_signals(recorded):
     assert tarquin.metabolites == ["NAA", "Cr"]
     assert concs.tolist() == [[8.33, 4.1], [8.33, 4.1]]
     assert sds.tolist() == [[3.0, 5.0], [3.0, 5.0]]
+
+
+def test_a_parallel_batch_needs_no_main_guard(tmp_path):
+    """A script that fits in parallel at its top level, as scripts and notebooks do. A
+    process pool would re-run it in every worker (macOS, Windows, Linux from Python 3.14),
+    each of them failing to start, and the batch would never finish."""
+    script = tmp_path / "unguarded.py"
+    script.write_text(textwrap.dedent(f"""\
+        import sys
+        sys.path.insert(0, {_REPO!r})
+        import numpy as np
+        from tarquin_wrapper import binaries, core
+        binaries.resolve_executable = lambda **kw: "/fake/tarquin"
+        def initiate(self, args):
+            with open(args[args.index("--output_txt") + 1], "w") as fh:
+                fh.write({RESULTS_TXT!r})
+            return ""
+        core.PyTARQUIN.initiate = initiate
+        tarquin = core.PyTARQUIN(bandwidth=4000, central_freq=123.2, echo_time=0.03,
+                                 multiprocessing=True)
+        print(tarquin(np.ones((4, 64), complex))[0].shape)
+        """))
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, timeout=60, cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.strip() == "(4, 2)"
 
 
 def test_a_run_without_results_is_an_error(monkeypatch):

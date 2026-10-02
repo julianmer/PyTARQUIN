@@ -22,6 +22,11 @@
 
 ## Installation
 
+### From PyPI
+```bash
+pip install tarquin-wrapper
+```
+
 ### From Source
 ```bash
 git clone https://github.com/julianmer/PyTARQUIN.git
