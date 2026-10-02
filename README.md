@@ -3,6 +3,7 @@
   <h1 style="margin-top:-10px; margin-bottom: 5px;">PyTARQUIN</h1>
   <p style="margin-top: 0px;"><em>A lightweight Python wrapper for TARQUIN spectral fitting in MR spectroscopy</em></p>
 
+  [![PyPI](https://img.shields.io/pypi/v/tarquin-wrapper.svg)](https://pypi.org/project/tarquin-wrapper/)
   [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
   [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](https://github.com/julianmer/PyTARQUIN/blob/main/LICENSE)
 </div>
